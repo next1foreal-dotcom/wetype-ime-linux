@@ -1,0 +1,19 @@
+[Groups/0]
+# Group Name
+Name=默认
+# Layout
+DefaultLayout=us
+# Default Input Method
+DefaultIM=wetype
+
+[Groups/0/Items/0]
+# Name
+Name=keyboard-us
+# Layout
+Layout=
+
+[Groups/0/Items/1]
+# Name
+Name=wetype
+# Layout
+Layout=
