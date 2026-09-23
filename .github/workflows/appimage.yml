@@ -1,0 +1,57 @@
+name: AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          # The runner's third-party apt sources would fail on arm64 indexes; the build does not need them.
+          sudo rm -f /etc/apt/sources.list.d/*.list
+          # Ubuntu serves arm64 packages from ports.ubuntu.com only.
+          sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          printf '%s\n' 'Types: deb' 'URIs: http://ports.ubuntu.com/ubuntu-ports' \
+            'Suites: noble noble-updates noble-security' 'Components: main universe' \
+            'Architectures: arm64' 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' |
+            sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libfcitx5core-dev patchelf binutils file \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user-static libc6-arm64-cross \
+            zlib1g:arm64 python3 unzip curl ca-certificates
+
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'   # no FUSE on the runner
+        run: |
+          scripts/e2_img.sh
+          sha256sum WeTypeIME-Engine-x86_64.AppImage > WeTypeIME-Engine-x86_64.AppImage.sha256
+          cat WeTypeIME-Engine-x86_64.AppImage.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WeTypeIME-Engine-x86_64
+          path: |
+            WeTypeIME-Engine-x86_64.AppImage
+            WeTypeIME-Engine-x86_64.AppImage.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            WeTypeIME-Engine-x86_64.AppImage WeTypeIME-Engine-x86_64.AppImage.sha256
