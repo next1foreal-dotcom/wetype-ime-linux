@@ -424,13 +424,13 @@ static void *F_NewLocalRef(void *env, void *o) { return o; }
 static void *F_ExceptionOccurred(void *env) { return NULL; }
 static void F_ExceptionClear(void *env) { }
 static unsigned char F_ExceptionCheck(void *env) { return 0; }
-static long F_GetJavaVM(void *env, void **vm) { LOG("GetJavaVM\n"); static void *fakevm[32]; *vm = fakevm; return 0; }
-
 /* 伪 JavaVM：JNI_OnLoad 会调 GetEnv（槽 6，双重间接同 JNIEnv） */
 static void *g_env;            /* 前向声明：定义在 env 布表区 */
 static void tab_v(int i, void *fn);
 static void *vmtab[32];
 static void *vmptr;
+/* 必须返回与 JNI_OnLoad 相同的 VM：引擎 env_stat 后台任务会用它 GetEnv */
+static long F_GetJavaVM(void *env, void **vm) { LOG("GetJavaVM\n"); *vm = &vmptr; return 0; }
 static long V_GetEnv(void *vm, void **penv, long version) {
     LOG("JavaVM->GetEnv(%#lx)\n", version);
     *penv = g_env;
