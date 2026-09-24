@@ -1,7 +1,7 @@
 // fcitx5 微信输入法 addon — 异步事件驱动版 (2026-09-10)
 //
 // 架构: fcitx5 主线程 IO 事件驱动, 全程零阻塞:
-//   keyEvent → 写 "L c" 到引擎 stdin(内核缓冲, 不等) + 本地即时回显 buf_
+//   keyEvent → 写 "B c" 到引擎 stdin(内核缓冲, 不等) + 本地即时回显 buf_
 //   引擎响应(CAND)通过 EventLoop IO 事件到达 → parseCand → 更新候选面板
 //   响应与命令按 FIFO handler 队列配对, 迟到/乱序不可能发生
 //
@@ -47,14 +47,7 @@ static constexpr int GRID_ROWS = 4;
 static constexpr int GRID_COLUMNS = 5;
 static constexpr int COMPACT_PAGE_SIZE = GRID_COLUMNS;
 static constexpr int PAGE_SIZE = GRID_ROWS * GRID_COLUMNS;
-static constexpr uint64_t CANDIDATE_DEBOUNCE_USEC = 40000;
-static constexpr size_t CANDIDATE_DEBOUNCE_MAX_CHARS = 4;
-
-static uint64_t monotonicUsec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000ull + ts.tv_nsec / 1000;
-}
+static constexpr uint64_t ENGINE_RESTART_DELAY_USEC = 200000;
 
 // Display-only segmentation. The original unsegmented buffer is still sent to
 // the WeType engine, so this never changes composition or candidate matching.
@@ -185,6 +178,7 @@ public:
     bool ready() const { return state_ == State::Ready; }
     bool gaveUp() const { return gaveUp_; }
     void setOnReady(std::function<void()> cb) { onReady_ = std::move(cb); }
+    void setOnExit(std::function<void()> cb) { onExit_ = std::move(cb); }
 
     // 非阻塞启动; 就绪走 IO 事件。指数退避防 fork 风暴(连续 5 次失败放弃)。
     bool start() {
@@ -296,7 +290,7 @@ public:
         ssize_t n = write(in_, out.data(), out.size());
         if (n < 0) {
             WLOG("write fail errno=%d → stop\n", errno);
-            stop();
+            die();
             if (h) h("");
             return;
         }
@@ -316,7 +310,7 @@ private:
         ssize_t n = read(fd, tmp, sizeof tmp);
         if (n <= 0) {
             WLOG("engine EOF (n=%zd)\n", n);
-            stop();
+            die();
             return;
         }
         rbuf_.append(tmp, n);
@@ -351,15 +345,22 @@ private:
 
     void onStartTimeout() {
         WLOG("engine start timeout → stop\n");
-        stop();
+        die();
     }
 
+    // 引擎意外退出: 清理后通知上层重启(主动 stop() 不通知)
+    void die() {
+        stop();
+        if (onExit_) onExit_();
+    }
+
+    // Handlers may restart the engine and queue new commands; those belong to
+    // the new process and must not be failed here.
     void failPendingHandlers() {
-        while (!pending_.empty()) {
-            Handler h = std::move(pending_.front());
-            pending_.pop_front();
+        std::deque<Handler> failed;
+        failed.swap(pending_);
+        for (auto &h : failed)
             if (h) h("");
-        }
     }
 
     EventLoop &loop_;
@@ -371,6 +372,7 @@ private:
     std::unique_ptr<EventSourceIO> ioSource_;
     std::unique_ptr<EventSourceTime> timeSource_;
     std::function<void()> onReady_;
+    std::function<void()> onExit_;
     int failCount_ = 0;
     bool gaveUp_ = false;
 };
@@ -384,10 +386,15 @@ public:
         std::string eng, dicts, work, qemu, sysroot;
         resolveDirs(eng, dicts, work, qemu, sysroot);
         WLOG("async addon init: eng=%s\n", eng.c_str());
-        // Start lazily on the first pinyin key. The Android engine has a
-        // background warmup path that can crash after sitting idle.
+        // Start eagerly so the first key never waits for the ~1.5 s engine
+        // startup, and bring the engine back as soon as it exits.
+        eng_.setOnExit([this] { scheduleRestart(); });
+        ensureEngine();
     }
-    ~WeTypeEngine() override { eng_.stop(); }
+    ~WeTypeEngine() override {
+        restartSource_.reset();
+        eng_.stop();
+    }
 
     void keyEvent(const InputMethodEntry &, KeyEvent &event) override;
 
@@ -400,7 +407,6 @@ public:
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
-        cancelPendingCandidates();
         windowStart_ = 0;
         selected_ = 0;
         expandedGrid_ = false;
@@ -427,7 +433,6 @@ public:
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
-        cancelPendingCandidates();
         windowStart_ = 0;
         selected_ = 0;
         expandedGrid_ = false;
@@ -510,7 +515,6 @@ private:
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
-        cancelPendingCandidates();
         windowStart_ = 0;
         selected_ = 0;
         expandedGrid_ = false;
@@ -538,12 +542,26 @@ private:
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
-        cancelPendingCandidates();
         windowStart_ = 0;
         selected_ = 0;
         expandedGrid_ = false;
         eng_.send("S " + std::to_string(index), candidateHandler());
         updateUI(*ic);
+    }
+
+    void scheduleRestart() {
+        if (restartSource_ || eng_.gaveUp()) return;
+        restartSource_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + ENGINE_RESTART_DELAY_USEC, 0,
+            [this](EventSourceTime *, uint64_t) {
+                restartSource_.reset();
+                if (eng_.alive()) return true;
+                WLOG("restarting engine after exit buffer_len=%zu\n", buf_.size());
+                ensureEngine();
+                // The new session is empty: replay the unfinished pinyin.
+                requestCandidates(buf_);
+                return true;
+            });
     }
 
     void ensureEngine() {
@@ -556,27 +574,6 @@ private:
             spansEnabled_ = resp == "OK";
             WLOG("candidate spans %s\n", spansEnabled_ ? "enabled" : "unavailable");
         });
-    }
-
-    void cancelPendingCandidates() {
-        debounceSource_.reset();
-        pendingKeys_.clear();
-    }
-
-    void scheduleCandidates(const std::string &keys) {
-        pendingKeys_ += keys;
-        debounceSource_.reset();
-        if (pendingKeys_.size() >= CANDIDATE_DEBOUNCE_MAX_CHARS) {
-            flushCandidates();
-            return;
-        }
-        debounceSource_ = instance_->eventLoop().addTimeEvent(
-            CLOCK_MONOTONIC, monotonicUsec() + CANDIDATE_DEBOUNCE_USEC, 0,
-            [this](EventSourceTime *, uint64_t) {
-                debounceSource_.reset();
-                flushCandidates();
-                return true;
-            });
     }
 
     // Handles a CAND/EMPTY reply for the buffer as it is now; replies that
@@ -599,9 +596,8 @@ private:
                     recoveryTried_ = true;
                     WLOG("engine response lost; restarting and replaying buffer_len=%zu revision=%llu\n",
                          buf_.size(), static_cast<unsigned long long>(revision_));
-                    cancelPendingCandidates();
                     ensureEngine();
-                    scheduleCandidates(buf_);
+                    requestCandidates(buf_);
                 }
                 return;
             }
@@ -611,7 +607,7 @@ private:
                 WLOG("unexpected candidate reply prefix=%.4s; replaying buffer_len=%zu\n",
                      resp.c_str(), buf_.size());
                 eng_.send("C", nullptr);
-                scheduleCandidates(buf_);
+                requestCandidates(buf_);
                 return;
             }
             cands_.clear();
@@ -640,12 +636,11 @@ private:
         };
     }
 
-    void flushCandidates() {
-        if (buf_.empty() || pendingKeys_.empty()) return;
-        std::string keys = std::move(pendingKeys_);
-        pendingKeys_.clear();
+    // Sends keys right away; the engine appends them to the current session.
+    void requestCandidates(const std::string &keys) {
+        if (buf_.empty() || keys.empty()) return;
         ensureEngine();
-        WLOG("send batch chars=%zu buffer_len=%zu revision=%llu\n", keys.size(),
+        WLOG("send keys chars=%zu buffer_len=%zu revision=%llu\n", keys.size(),
              buf_.size(), static_cast<unsigned long long>(revision_));
         eng_.send("B " + keys, candidateHandler());
     }
@@ -653,8 +648,7 @@ private:
     Instance *instance_;
     EngineProc eng_;
     std::string buf_;
-    std::string pendingKeys_;
-    std::unique_ptr<EventSourceTime> debounceSource_;
+    std::unique_ptr<EventSourceTime> restartSource_;
     std::vector<std::string> cands_;
     std::vector<int> covers_;     // pinyin letters each candidate consumes (0 = unknown)
     bool spansEnabled_ = false;
@@ -674,7 +668,6 @@ private:
         cands_.clear();
         covers_.clear();
         candidatesCurrent_ = false;
-        cancelPendingCandidates();
         windowStart_ = 0;
         selected_ = 0;
         expandedGrid_ = false;
@@ -713,14 +706,13 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
             ++revision_;
             buf_ += c;
             candidatesCurrent_ = false;
-            WLOG("typed alpha buffer_len=%zu pending_before=%zu revision=%llu\n",
-                 buf_.size(), pendingKeys_.size(), static_cast<unsigned long long>(revision_));
-            if (replayBuffer) cancelPendingCandidates();
+            WLOG("typed alpha buffer_len=%zu revision=%llu\n",
+                 buf_.size(), static_cast<unsigned long long>(revision_));
             handled = true;
             // Refresh the preedit immediately while keeping the last
             // candidate page visible until the new engine response arrives.
             updateUI(*ic);
-            scheduleCandidates(replayBuffer ? buf_ : std::string(1, c));
+            requestCandidates(replayBuffer ? buf_ : std::string(1, c));
         }
         // The compact single row expands to the four-row grid on Down.
         else if (!buf_.empty() && candidatesCurrent_ && !cands_.empty() &&
@@ -804,7 +796,6 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
                 cands_.clear();
                 covers_.clear();
                 candidatesCurrent_ = false;
-                cancelPendingCandidates();
                 windowStart_ = 0;
                 selected_ = 0;
                 expandedGrid_ = false;
@@ -845,7 +836,6 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
                 buf_.pop_back();
                 ++revision_;
                 candidatesCurrent_ = false;
-                cancelPendingCandidates();
                 handled = true;
                 eng_.send("C", nullptr);
                 if (buf_.empty()) {
@@ -857,7 +847,7 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
                     expandedGrid_ = false;
                     updateUI(*ic);
                 } else {
-                    scheduleCandidates(buf_);
+                    requestCandidates(buf_);
                     updateUI(*ic);
                 }
             }
@@ -870,7 +860,6 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
                 cands_.clear();
                 covers_.clear();
                 candidatesCurrent_ = false;
-                cancelPendingCandidates();
                 windowStart_ = 0;
                 selected_ = 0;
                 expandedGrid_ = false;

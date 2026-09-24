@@ -822,7 +822,6 @@ static void run_daemon(void *h, long sid) {
             daemon_drop_events(sym_dci);
             if (g_cur_it && sym_dci) { ((void (*)(void *, void *, long))sym_dci)(g_env, NULL, g_cur_it); g_cur_it = 0; }
             ((void (*)(void *, void *, long))sym_ds)(g_env, NULL, sid);
-            usleep(50000);
             sid = daemon_new_session(sym_cs, sym_asl);
             g_ct_n = 0; g_last_iterator = 0;
             sent_n = 0; sent[0] = 0; sent_known = 1;
