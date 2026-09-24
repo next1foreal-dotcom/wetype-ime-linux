@@ -576,8 +576,10 @@ private:
         });
     }
 
-    // Handles a CAND/EMPTY reply for the buffer as it is now; replies that
-    // arrive after the buffer changed are ignored.
+    // Handles a CAND/EMPTY reply for the buffer as it is now. A reply for an
+    // earlier prefix of the pinyin still being typed is shown as a
+    // non-selectable preview so fast typing keeps refreshing the panel; other
+    // stale replies are ignored.
     EngineProc::Handler candidateHandler() {
         auto ref = icRef_;
         const auto expectedBuf = buf_;
@@ -587,7 +589,13 @@ private:
             WLOG("response len=%zu prefix=%.4s expected_revision=%llu current_revision=%llu valid_ic=%d\n",
                  resp.size(), resp.c_str(), static_cast<unsigned long long>(expectedRevision),
                  static_cast<unsigned long long>(revision_), ic ? 1 : 0);
-            if (!ic || expectedRevision != revision_ || expectedBuf != buf_) return;
+            if (!ic || resp == "SKIP") return;   // SKIP: merged into a later request
+            const bool current = expectedRevision == revision_ && expectedBuf == buf_;
+            const bool preview = !current && !expectedBuf.empty() &&
+                                 buf_.size() > expectedBuf.size() &&
+                                 buf_.compare(0, expectedBuf.size(), expectedBuf) == 0 &&
+                                 resp.rfind("CAND\t", 0) == 0;
+            if (!current && !preview) return;
             if (resp.empty()) {
                 // Keep the last visible page while recovering; a transient
                 // missing response must not collapse the candidate panel.
@@ -628,8 +636,9 @@ private:
                     covers_.push_back(cover);
                 }
             }
-            candidatesCurrent_ = true;
-            WLOG("parsed candidates=%zu buffer_len=%zu\n", cands_.size(), buf_.size());
+            candidatesCurrent_ = current;
+            WLOG("parsed candidates=%zu buffer_len=%zu preview=%d\n", cands_.size(), buf_.size(),
+                 preview ? 1 : 0);
             windowStart_ = 0;
             selected_ = 0;
             updateUI(*ic);

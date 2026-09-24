@@ -19,6 +19,7 @@
 #include <link.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <poll.h>
 
 #define ENV_SLOTS 300
 
@@ -739,6 +740,48 @@ static void daemon_reply_cands(int got, int spans) {
     fflush(NULL);
 }
 
+/* ---------- 命令读取 ----------
+ * 自带缓冲的按行读取，以便在不阻塞的情况下查看管道里是否还有积压的命令。 */
+static char g_in[8192];
+static size_t g_in_len;
+
+/* 缓冲区里没有完整行时读一次 fd 0；block=0 时只在可读时读。返回 0 表示没有新数据。 */
+static int cmd_fill(int block) {
+    if (!block) {
+        struct pollfd pfd = {0, POLLIN, 0};
+        if (poll(&pfd, 1, 0) <= 0) return 0;
+    }
+    if (g_in_len == sizeof g_in) g_in_len = 0;   /* 超长行：丢弃 */
+    ssize_t r;
+    do r = read(0, g_in + g_in_len, sizeof g_in - g_in_len); while (r < 0 && errno == EINTR);
+    if (r <= 0) return 0;
+    g_in_len += (size_t)r;
+    return 1;
+}
+
+/* 取下一行（不含换行）。block=0 时没有完整行立即返回 0；阻塞模式下 EOF 返回 0。 */
+static int cmd_read(char *line, size_t cap, int block) {
+    for (;;) {
+        char *nl = memchr(g_in, '\n', g_in_len);
+        if (nl) {
+            size_t n = (size_t)(nl - g_in), keep = n < cap - 1 ? n : cap - 1;
+            memcpy(line, g_in, keep);
+            line[keep] = 0;
+            g_in_len -= n + 1;
+            memmove(g_in, nl + 1, g_in_len);
+            return 1;
+        }
+        if (!cmd_fill(block)) return 0;
+    }
+}
+
+/* 管道里是否已经有下一条完整的 B 命令（不消费）。 */
+static int cmd_next_is_batch(void) {
+    while (!memchr(g_in, '\n', g_in_len))
+        if (!cmd_fill(0)) return 0;
+    return g_in_len > 2 && g_in[0] == 'B' && g_in[1] == ' ';
+}
+
 /* ---------- daemon 主循环 ---------- */
 static void run_daemon(void *h, long sid) {
     void *sym_pi  = dlsym(h, "_Z13process_inputP7_JNIEnvP8_jobjectlP8_jstringP11_jbyteArray");
@@ -756,7 +799,7 @@ static void run_daemon(void *h, long sid) {
     int sent_known = 1;     /* 0: 部分选词或超长后无法与 PendingInput 对齐 */
     int spans = 0;          /* OPT spans: 候选带覆盖长度，S 部分选词回复剩余候选 */
     proto_printf("READY\n");
-    while (fgets(line, sizeof line, stdin)) {
+    while (cmd_read(line, sizeof line, 1)) {
         size_t L = strlen(line);
         while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
         if (L == 0) continue;
@@ -767,9 +810,25 @@ static void run_daemon(void *h, long sid) {
         if (!strcmp(line, "OPT spans")) { spans = 1; proto_printf("OK\n"); fflush(NULL); continue; }
         if (!strcmp(line, "SAVE")) { proto_printf("OK\n"); fflush(NULL); continue; }  /* 选词时引擎已落盘 */
         if ((line[0] == 'L' || line[0] == 'B') && line[1] == ' ') {
-            /* L 单键兼容；B 把防抖窗口内的字母合并，只在末尾取一次候选。 */
-            const char *keys = line + 2;
-            if (!*keys || !sid) { proto_printf("EMPTY\n"); fflush(NULL); continue; }
+            /* L 单键兼容；B 可带多个字母，只在末尾取一次候选。
+             * 引擎跟不上时管道里会积压多条 B：一并送入，只对最后一条回复候选，
+             * 之前的各回复 SKIP（一问一答的配对不变）。 */
+            char keys[sizeof line];
+            snprintf(keys, sizeof keys, "%s", line + 2);
+            int skipped = 0;
+            if (line[0] == 'B') {
+                char next[sizeof line];
+                while (strlen(keys) + 64 < sizeof keys && cmd_next_is_batch() &&
+                       cmd_read(next, sizeof next, 0)) {
+                    strncat(keys, next + 2, sizeof keys - strlen(keys) - 1);
+                    skipped++;
+                }
+                if (skipped) fprintf(stderr, "[daemon] coalesced %d queued batches\n", skipped + 1);
+            }
+            if (!*keys || !sid) {
+                for (int i = 0; i < skipped; i++) proto_printf("SKIP\n");
+                proto_printf("EMPTY\n"); fflush(NULL); continue;
+            }
             daemon_drop_events(sym_dci);
             for (const char *p = keys; *p; ++p) {
                 char key[2] = {*p, '\0'};
@@ -785,6 +844,7 @@ static void run_daemon(void *h, long sid) {
             int got = it ? daemon_fetch_cands(sym_cg, sym_dci, it) : -1;
             fprintf(stderr, "[daemon] input batch chars=%zu composition_len=%zu callbacks=%lu exact=%d iterator=%#lx candidates=%d\n",
                     strlen(keys), sent_n, g_cand_callback_count, exact, it, got);
+            for (int i = 0; i < skipped; i++) proto_printf("SKIP\n");
             daemon_reply_cands(got, spans);
             continue;
         }
