@@ -2,6 +2,7 @@
 # WeType 引擎 CLI 演示: wetype-ime-demo.sh <拼音串> → 候选词
 # 用法: bash wetype-ime-demo.sh nihao    (引擎目录由 WETYPE_ENGINE_DIR 指定, 默认开发目录)
 set -e
+ulimit -c 0
 WORD="${1:-nihao}"
 ENG="${WETYPE_ENGINE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 HARNESS="$ENG/harness/jinterop"

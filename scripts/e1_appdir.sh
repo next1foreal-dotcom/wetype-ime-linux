@@ -78,6 +78,7 @@ chmod +x "$APPDIR"/usr/lib/wetype-ime/scripts/*.sh
 cat > "$APPDIR/usr/bin/wetype-ime-engine" <<EOF
 #!/bin/bash
 ENG="\$(dirname "\$(readlink -f "\$0")")/../lib/wetype-ime/arm64"
+ulimit -c 0
 USRDATA="\${XDG_DATA_HOME:-\$HOME/.local/share}/wetype-ime"
 mkdir -p "\$USRDATA/dict/userdict/v5" "\$USRDATA/dict/userdict/user_hot_word"
 QEMU="\${QEMU_AARCH64:-\$ENG/qemu-aarch64-static}"

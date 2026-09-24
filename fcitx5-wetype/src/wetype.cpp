@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -208,6 +209,10 @@ public:
             return false;
         }
         if (p == 0) {
+            // QEMU user mode writes guest core files in its current directory.
+            // Keep an engine crash from leaving qemu_wetype-harness_*.core in HOME.
+            const struct rlimit noCore = {0, 0};
+            if (setrlimit(RLIMIT_CORE, &noCore) < 0) _exit(127);
             dup2(inP[0], 0);
             dup2(outP[1], 1);
             close(inP[0]);
